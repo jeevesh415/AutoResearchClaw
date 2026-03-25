@@ -39,6 +39,16 @@ class AnthropicAdapter:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout_sec = timeout_sec
+        self._client: httpx.Client | None = None
+
+    def close(self) -> None:
+        """BUG-DA8-09: Close the httpx connection pool to prevent fd leaks."""
+        if self._client is not None:
+            try:
+                self._client.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._client = None
 
     def chat_completion(
         self,
@@ -77,9 +87,11 @@ class AnthropicAdapter:
                 merged.append(dict(msg))
         user_messages = merged
 
-        # Ensure at least one user message
+        # Ensure at least one user message and that it starts with "user"
         if not user_messages:
             user_messages = [{"role": "user", "content": "Hello."}]
+        elif user_messages[0]["role"] != "user":
+            user_messages.insert(0, {"role": "user", "content": "Continue."})
 
         # Prepend JSON instruction when json_mode is requested
         if json_mode:
@@ -88,6 +100,13 @@ class AnthropicAdapter:
                 if system_msg
                 else _JSON_MODE_INSTRUCTION
             )
+
+        # BUG-DA8-05: Thinking-enabled Claude models require temperature=1.0
+        # and do not accept other temperature values.
+        _THINKING_MODELS = ("claude-3-7", "claude-4")
+        _is_thinking = any(model.startswith(p) for p in _THINKING_MODELS)
+        if _is_thinking:
+            temperature = 1.0
 
         # Build Anthropic request
         body: dict[str, Any] = {
@@ -107,10 +126,11 @@ class AnthropicAdapter:
         }
 
         try:
-            with httpx.Client(timeout=self.timeout_sec) as client:
-                response = client.post(url, headers=headers, json=body)
-                response.raise_for_status()
-                data = response.json()
+            if self._client is None:
+                self._client = httpx.Client(timeout=self.timeout_sec)
+            response = self._client.post(url, headers=headers, json=body)
+            response.raise_for_status()
+            data = response.json()
         except httpx.HTTPStatusError as exc:
             # Convert to urllib.error.HTTPError for upstream retry logic.
             # Include Anthropic's error body so upstream logs show the

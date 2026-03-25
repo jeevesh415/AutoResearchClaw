@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import weakref
 from dataclasses import dataclass
@@ -66,14 +67,18 @@ class ACPClient:
 
     # Track live instances for atexit cleanup (weak refs to avoid preventing GC)
     _live_instances: list[weakref.ref[ACPClient]] = []
+    _atexit_registered: bool = False
 
     def __init__(self, acp_config: ACPConfig) -> None:
         self.config = acp_config
         self._acpx: str | None = acp_config.acpx_command or None
         self._session_ready = False
-        # Register for atexit cleanup to prevent zombie acpx processes
+        # Prune dead weakrefs, then track this instance
+        ACPClient._live_instances = [r for r in ACPClient._live_instances if r() is not None]
         ACPClient._live_instances.append(weakref.ref(self))
-        atexit.register(ACPClient._atexit_cleanup)
+        if not ACPClient._atexit_registered:
+            atexit.register(ACPClient._atexit_cleanup)
+            ACPClient._atexit_registered = True
 
     @classmethod
     def from_rc_config(cls, rc_config: Any) -> ACPClient:
@@ -203,7 +208,8 @@ class ACPClient:
             [acpx, "--ttl", "0", "--cwd", self._abs_cwd(),
              self.config.agent, "sessions", "ensure",
              "--name", self.config.session_name],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=30,
         )
         if result.returncode != 0:
             # Fall back to 'new'
@@ -211,7 +217,8 @@ class ACPClient:
                 [acpx, "--ttl", "0", "--cwd", self._abs_cwd(),
                  self.config.agent, "sessions", "new",
                  "--name", self.config.session_name],
-                capture_output=True, text=True, timeout=30,
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=30,
             )
             if result.returncode != 0:
                 raise RuntimeError(
@@ -220,8 +227,24 @@ class ACPClient:
         self._session_ready = True
         logger.info("ACP session '%s' ready (%s)", self.config.session_name, self.config.agent)
 
-    # Linux MAX_ARG_STRLEN is 128KB; stay well under to leave room for env
-    _MAX_CLI_PROMPT_BYTES = 100_000
+    # Linux MAX_ARG_STRLEN is 128 KB; Windows CreateProcess limit is ~32 KB
+    # for the entire command line, not just the prompt payload. acpx adds
+    # several fixed arguments plus quoting overhead, so leave generous headroom
+    # on Windows and switch to temp-file transport earlier.
+    _MAX_CLI_PROMPT_BYTES = 20_000 if sys.platform == "win32" else 100_000
+    # On Windows, npm-installed CLIs usually resolve to ``.cmd`` launchers,
+    # which are routed through ``cmd.exe`` and hit a much smaller practical
+    # command-line limit (~8 KB). Use file transport much earlier there.
+    _MAX_CMD_WRAPPER_PROMPT_BYTES = 6_000 if sys.platform == "win32" else 100_000
+
+    # Localized error snippets for "command line too long" (may be in any OS language)
+    _CMD_TOO_LONG_HINTS = (
+        "too long",       # English Windows
+        "trop long",      # French Windows
+        "zu lang",        # German Windows
+        "demasiado larg", # Spanish Windows
+        "e2big",          # POSIX
+    )
 
     # Error patterns that indicate a dead/stale session (retryable)
     _RECONNECT_ERRORS = (
@@ -230,6 +253,16 @@ class ACPClient:
         "Query closed",
     )
     _MAX_RECONNECT_ATTEMPTS = 2
+
+    @classmethod
+    def _cli_prompt_limit(cls, acpx: str | None) -> int:
+        """Return the safe inline-prompt size for the resolved ACP launcher."""
+        limit = cls._MAX_CLI_PROMPT_BYTES
+        if sys.platform == "win32" and acpx:
+            lower = acpx.lower()
+            if lower.endswith((".cmd", ".bat")):
+                return min(limit, cls._MAX_CMD_WRAPPER_PROMPT_BYTES)
+        return limit
 
     def _send_prompt(self, prompt: str) -> str:
         """Send a prompt via acpx and return the response text.
@@ -246,11 +279,13 @@ class ACPClient:
             raise RuntimeError("acpx not found")
 
         prompt_bytes = len(prompt.encode("utf-8"))
-        use_file = prompt_bytes > self._MAX_CLI_PROMPT_BYTES
+        prompt_limit = self._cli_prompt_limit(acpx)
+        use_file = prompt_bytes > prompt_limit
         if use_file:
             logger.info(
-                "Prompt too large for CLI arg (%d bytes). Using temp file.",
+                "Prompt too large for CLI arg (%d bytes > %d). Using temp file.",
                 prompt_bytes,
+                prompt_limit,
             )
 
         last_exc: RuntimeError | None = None
@@ -260,7 +295,33 @@ class ACPClient:
                 if use_file:
                     return self._send_prompt_via_file(acpx, prompt)
                 return self._send_prompt_cli(acpx, prompt)
+            except OSError as os_exc:
+                # OS-level failure (e.g., Windows CreateProcess arg limit).
+                # Fall back to temp-file transport automatically.
+                if not use_file:
+                    logger.warning(
+                        "CLI subprocess raised OSError, "
+                        "falling back to temp file: %s",
+                        os_exc,
+                    )
+                    use_file = True
+                    return self._send_prompt_via_file(acpx, prompt)
+                raise RuntimeError(
+                    f"ACP prompt failed: {os_exc}"
+                ) from os_exc
             except RuntimeError as exc:
+                # Detect localized "command line too long" from subprocess stderr
+                exc_lower = str(exc).lower()
+                if not use_file and any(
+                    h in exc_lower for h in self._CMD_TOO_LONG_HINTS
+                ):
+                    logger.warning(
+                        "CLI prompt too long for OS, "
+                        "falling back to temp file: %s",
+                        exc,
+                    )
+                    use_file = True
+                    return self._send_prompt_via_file(acpx, prompt)
                 if not any(pat in str(exc) for pat in self._RECONNECT_ERRORS):
                     raise
                 last_exc = exc
@@ -285,16 +346,21 @@ class ACPClient:
 
     def _send_prompt_cli(self, acpx: str, prompt: str) -> str:
         """Send prompt as a CLI argument (original path)."""
-        result = subprocess.run(
-            [acpx, "--approve-all", "--ttl", "0", "--cwd", self._abs_cwd(),
-             self.config.agent, "-s", self.config.session_name,
-             prompt],
-            capture_output=True, text=True,
-            timeout=self.config.timeout_sec,
-        )
+        try:
+            result = subprocess.run(
+                [acpx, "--approve-all", "--ttl", "0", "--cwd", self._abs_cwd(),
+                 self.config.agent, "-s", self.config.session_name,
+                 prompt],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=self.config.timeout_sec,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"ACP prompt timed out after {self.config.timeout_sec}s"
+            ) from exc
 
         if result.returncode != 0:
-            stderr = result.stderr.strip()
+            stderr = (result.stderr or "").strip()
             raise RuntimeError(f"ACP prompt failed (exit {result.returncode}): {stderr}")
 
         return self._extract_response(result.stdout)
@@ -302,7 +368,7 @@ class ACPClient:
     def _send_prompt_via_file(self, acpx: str, prompt: str) -> str:
         """Write prompt to a temp file, ask the agent to read and respond."""
         fd, prompt_path = tempfile.mkstemp(
-            suffix=".md", prefix="rc_prompt_", dir="/tmp"
+            suffix=".md", prefix="rc_prompt_",
         )
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -315,16 +381,21 @@ class ACPClient:
                 f"just produce the requested output."
             )
 
-            result = subprocess.run(
-                [acpx, "--approve-all", "--ttl", "0", "--cwd", self._abs_cwd(),
-                 self.config.agent, "-s", self.config.session_name,
-                 short_prompt],
-                capture_output=True, text=True,
-                timeout=self.config.timeout_sec,
-            )
+            try:
+                result = subprocess.run(
+                    [acpx, "--approve-all", "--ttl", "0", "--cwd", self._abs_cwd(),
+                     self.config.agent, "-s", self.config.session_name,
+                     short_prompt],
+                    capture_output=True, text=True, encoding="utf-8",
+                    errors="replace", timeout=self.config.timeout_sec,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError(
+                    f"ACP prompt timed out after {self.config.timeout_sec}s"
+                ) from exc
 
             if result.returncode != 0:
-                stderr = result.stderr.strip()
+                stderr = (result.stderr or "").strip()
                 raise RuntimeError(
                     f"ACP prompt failed (exit {result.returncode}): {stderr}"
                 )
@@ -337,13 +408,15 @@ class ACPClient:
                 pass
 
     @staticmethod
-    def _extract_response(raw_output: str) -> str:
+    def _extract_response(raw_output: str | None) -> str:
         """Extract the agent's actual response from acpx output.
 
         Strips acpx metadata lines ([client], [acpx], [tool], [done])
         and their continuation lines (indented or sub-field lines like
         ``input:``, ``output:``, ``files:``, ``kind:``).
         """
+        if not raw_output:
+            return ""
         lines: list[str] = []
         in_tool_block = False
         for line in raw_output.splitlines():

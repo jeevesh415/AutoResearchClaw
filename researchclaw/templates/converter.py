@@ -181,9 +181,38 @@ def _sanitize_latex_output(
 
     tex = _cite_outside_verbatim(tex)
 
+    # 1c. BUG-110 safety net: Replace any remaining Unicode Greek/math symbols.
+    #     _convert_inline handles most, but titles, captions, and preamble
+    #     fragments can still contain raw Unicode that kills pdflatex.
+    for _uchar, _lcmd in _UNICODE_GREEK_TO_LATEX.items():
+        if _uchar in tex:
+            tex = tex.replace(_uchar, _lcmd)
+
     # 2. Remove HTML entities that survived pre-processing
     tex = tex.replace("&nbsp;", "~")
     tex = tex.replace("&amp;", "\\&")
+
+    # 2b. Fix escaped \& inside tabular data rows.  The converter's
+    #     _convert_inline escapes & globally; inside tabular environments
+    #     the & must remain unescaped as the column separator.
+    if "\\begin{tabular}" in tex and "\\&" in tex:
+
+        def _fix_tabular_amp(m: re.Match[str]) -> str:
+            block = m.group(0)
+            if "\\&" not in block:
+                return block
+            lines = block.split("\n")
+            for i, line in enumerate(lines):
+                if "\\&" in line and "\\\\" in line:
+                    lines[i] = line.replace("\\&", "&")
+            return "\n".join(lines)
+
+        tex = re.sub(
+            r"\\begin\{tabular\}.*?\\end\{tabular\}",
+            _fix_tabular_amp,
+            tex,
+            flags=re.DOTALL,
+        )
 
     # 3. Remove stray markdown code fences in LaTeX body (outside verbatim)
     #    Only match fences NOT inside \begin{verbatim}...\end{verbatim}
@@ -198,6 +227,21 @@ def _sanitize_latex_output(
         r"\\caption{\1 -- Summary of experimental results.}",
         tex,
     )
+
+    # 4b. Auto-map orphan \ref{fig:X} to closest \label{fig:Y} by prefix.
+    #     The converter generates long labels from captions (fig:overall_cifar_100)
+    #     but the LLM references short names (fig:overall).
+    fig_labels = set(re.findall(r"\\label\{(fig:[^}]+)\}", tex))
+    fig_refs = set(re.findall(r"\\ref\{(fig:[^}]+)\}", tex))
+    orphan_refs = fig_refs - fig_labels
+    orphan_labels = fig_labels - fig_refs
+    if orphan_refs and orphan_labels:
+        for oref in orphan_refs:
+            # Find a label that starts with the ref prefix
+            candidates = [l for l in orphan_labels if l.startswith(oref)]
+            if len(candidates) == 1:
+                tex = tex.replace(f"\\ref{{{oref}}}", f"\\ref{{{candidates[0]}}}")
+                orphan_labels.discard(candidates[0])
 
     # 5. Fix "Untitled Paper" / "Running Title" fallback titles
     tex = re.sub(
@@ -760,8 +804,11 @@ def _build_body(sections: list[_Section], *, title: str = "") -> str:
 
     # Promote if: (a) title was H1 and body starts at H2, OR
     # (b) no title H1 found but all body sections are H2+ (LLM omitted H1 title)
+    # BUG-166: When title is H1 AND body also uses H1 for main sections,
+    # offset must be 0 — otherwise H1→max(1,1-1)=1 and H2→max(1,2-1)=1
+    # both collapse to \section, losing all subsection hierarchy.
     if title_h1_found:
-        level_offset = 1
+        level_offset = 1 if min_body_level >= 2 else 0
     elif min_body_level >= 2:
         # All body sections are H2 or deeper — promote so H2→\section
         level_offset = min_body_level - 1
@@ -906,6 +953,27 @@ def _convert_block(text: str) -> str:
 
     text = _FENCED_CODE_RE.sub(_stash_code, text)
 
+    # Protect raw LaTeX environments (table, figure, algorithm, etc.)
+    # These appear when pre-built LaTeX (e.g. anti-fabrication result tables)
+    # is embedded directly in the markdown.  Without protection, their
+    # contents go through _convert_inline which double-escapes {, }, _, &.
+    latex_env_blocks: list[str] = []
+
+    def _stash_latex_env(m: re.Match[str]) -> str:
+        idx = len(latex_env_blocks)
+        latex_env_blocks.append(m.group(0))
+        return f"%%LATEX_ENV_{idx}%%"
+
+    # Match \begin{env}...\end{env} for environments that should pass through.
+    text = re.sub(
+        r"\\begin\{(table|figure|tabular|algorithm|algorithmic|equation|align"
+        r"|gather|multline|minipage|tikzpicture)\*?\}.*?"
+        r"\\end\{\1\*?\}",
+        _stash_latex_env,
+        text,
+        flags=re.DOTALL,
+    )
+
     # Process line by line for lists, tables, and paragraphs
     lines = text.split("\n")
     output: list[str] = []
@@ -923,6 +991,13 @@ def _convert_block(text: str) -> str:
         if line.strip().startswith("%%CODE_BLOCK_"):
             idx = int(re.search(r"\d+", line.strip()).group())  # type: ignore[union-attr]
             output.append(code_blocks[idx])
+            i += 1
+            continue
+
+        # Stashed LaTeX environments — pass through unchanged
+        if line.strip().startswith("%%LATEX_ENV_"):
+            idx = int(re.search(r"\d+", line.strip()).group())  # type: ignore[union-attr]
+            output.append(latex_env_blocks[idx])
             i += 1
             continue
 
@@ -1066,8 +1141,25 @@ def _render_table(table_lines: list[str], caption: str = "") -> str:
     lines_out: list[str] = []
     lines_out.append("\\begin{table}[ht]")
     lines_out.append("\\centering")
+
+    # Caption ABOVE table (standard academic convention)
+    if caption:
+        cap_text = re.sub(r"^Table\s+\d+[.:]\s*", "", caption).strip()
+        if cap_text:
+            lines_out.append(f"\\caption{{{_convert_inline(cap_text)}}}")
+        else:
+            auto_cap = _auto_table_caption(header, table_num)
+            lines_out.append(f"\\caption{{{auto_cap}}}")
+    else:
+        auto_cap = _auto_table_caption(header, table_num)
+        lines_out.append(f"\\caption{{{auto_cap}}}")
+    lines_out.append(f"\\label{{tab:{table_num}}}")
+
     if needs_resize:
-        lines_out.append("\\resizebox{\\textwidth}{!}{%")
+        # BUG-109b fix: Use \columnwidth (works in both 1-col and 2-col layouts)
+        # \textwidth in 2-column formats (ICML) is full page width, causing
+        # floats wider than a column to be "lost" by LaTeX.
+        lines_out.append("\\resizebox{\\columnwidth}{!}{%")
     lines_out.append(f"\\begin{{tabular}}{{{col_spec}}}")
     lines_out.append("\\toprule")
     lines_out.append(
@@ -1084,20 +1176,6 @@ def _render_table(table_lines: list[str], caption: str = "") -> str:
     lines_out.append("\\end{tabular}")
     if needs_resize:
         lines_out.append("}")  # close resizebox
-
-    # IMP-32: Generate descriptive caption from header if caption is generic
-    if caption:
-        cap_text = re.sub(r"^Table\s+\d+[.:]\s*", "", caption).strip()
-        if cap_text:
-            lines_out.append(f"\\caption{{{_convert_inline(cap_text)}}}")
-        else:
-            # Caption was just "Table N" — generate from header
-            auto_cap = _auto_table_caption(header, table_num)
-            lines_out.append(f"\\caption{{{auto_cap}}}")
-    else:
-        auto_cap = _auto_table_caption(header, table_num)
-        lines_out.append(f"\\caption{{{auto_cap}}}")
-    lines_out.append(f"\\label{{tab:{table_num}}}")
     lines_out.append("\\end{table}")
 
     return "\n".join(lines_out)
@@ -1182,10 +1260,107 @@ _UNICODE_TO_ASCII: dict[str, str] = {
 }
 
 
+# BUG-110: Unicode Greek → LaTeX math replacements for inline text.
+# Used in _convert_inline() and _sanitize_latex_output().
+_UNICODE_GREEK_TO_LATEX: dict[str, str] = {
+    # Lowercase
+    "\u03b1": "$\\alpha$", "\u03b2": "$\\beta$", "\u03b3": "$\\gamma$",
+    "\u03b4": "$\\delta$", "\u03b5": "$\\epsilon$", "\u03b6": "$\\zeta$",
+    "\u03b7": "$\\eta$", "\u03b8": "$\\theta$", "\u03b9": "$\\iota$",
+    "\u03ba": "$\\kappa$", "\u03bb": "$\\lambda$", "\u03bc": "$\\mu$",
+    "\u03bd": "$\\nu$", "\u03be": "$\\xi$", "\u03c0": "$\\pi$",
+    "\u03c1": "$\\rho$", "\u03c3": "$\\sigma$", "\u03c4": "$\\tau$",
+    "\u03c5": "$\\upsilon$", "\u03c6": "$\\phi$", "\u03c7": "$\\chi$",
+    "\u03c8": "$\\psi$", "\u03c9": "$\\omega$",
+    # Uppercase
+    "\u0393": "$\\Gamma$", "\u0394": "$\\Delta$", "\u0398": "$\\Theta$",
+    "\u039b": "$\\Lambda$", "\u039e": "$\\Xi$", "\u03a0": "$\\Pi$",
+    "\u03a3": "$\\Sigma$", "\u03a6": "$\\Phi$", "\u03a8": "$\\Psi$",
+    "\u03a9": "$\\Omega$",
+    # Common math symbols not already handled
+    "\u2200": "$\\forall$", "\u2203": "$\\exists$",
+    "\u2207": "$\\nabla$", "\u2202": "$\\partial$",
+    "\u2026": "\\ldots{}", "\u22c5": "$\\cdot$",
+    "\u2113": "$\\ell$", "\u222b": "$\\int$",
+    "\u2209": "$\\notin$",
+    # Common symbols that cause null-byte corruption if not converted
+    "\u00b1": "$\\pm$",        # ±
+    "\u00d7": "$\\times$",     # ×
+    "\u2248": "$\\approx$",    # ≈
+    "\u2264": "$\\leq$",       # ≤
+    "\u2265": "$\\geq$",       # ≥
+    "\u2260": "$\\neq$",       # ≠
+    "\u221e": "$\\infty$",     # ∞
+    # Additional symbols found in Runs 49-52
+    "\u2212": "$-$",           # − (minus sign, distinct from hyphen)
+    "\u2282": "$\\subset$",    # ⊂
+    "\u222a": "$\\cup$",       # ∪
+    "\u211d": "$\\mathbb{R}$", # ℝ
+    "\u0302": "\\^{}",         # ̂  (combining circumflex)
+    "\u0303": "\\~{}",         # ̃  (combining tilde — Run 61 pseudocode)
+    "\u221d": "$\\propto$",    # ∝ (proportional to)
+    "\u2208": "$\\in$",        # ∈
+}
+
 _ALGO_KEYWORDS = re.compile(
     r"\b(Input|Output|Return|While|For|If|Else|Repeat|Until|Function|Procedure|Algorithm)\b",
     re.IGNORECASE,
 )
+
+
+def _escape_algo_line(line: str) -> str:
+    """Escape LaTeX special characters in an algorithmic pseudocode line.
+
+    BUG-177: Raw pseudocode lines contain Python/math syntax that breaks
+    pdflatex: ``#`` (comment char), ``_`` (subscript), ``%`` (comment),
+    ``&`` (alignment), ``{}``, ``~``, ``^``.
+
+    Strategy:
+    1. Convert ``# comment`` at end of line → ``\\COMMENT{comment}``
+    2. Protect existing LaTeX commands and math delimiters
+    3. Escape remaining special characters
+    """
+    # Step 1: Convert Python-style end-of-line comments → \COMMENT{...}
+    # Match `# comment` that isn't at the start of the line (those are full-line comments)
+    _comment_match = re.search(r"(?<=\s)#\s*(.+)$", line)
+    comment_suffix = ""
+    if _comment_match:
+        comment_text = _comment_match.group(1).strip()
+        line = line[: _comment_match.start()].rstrip()
+        comment_suffix = f" \\COMMENT{{{comment_text}}}"
+    elif line.strip().startswith("#"):
+        # Full-line comment
+        comment_text = line.strip().lstrip("#").strip()
+        return f"\\COMMENT{{{comment_text}}}"
+
+    # Step 2: Protect existing LaTeX commands and math mode from escaping
+    protected: list[str] = []
+
+    def _protect(m: re.Match[str]) -> str:
+        idx = len(protected)
+        protected.append(m.group(0))
+        return f"\x00ALG{idx}\x00"
+
+    # Protect: \command{...}, $...$, \(...\)
+    line = re.sub(r"\\[a-zA-Z]+\{[^}]*\}", _protect, line)
+    line = re.sub(r"\$[^$]+\$", _protect, line)
+    line = re.sub(r"\\\(.+?\\\)", _protect, line)
+
+    # Step 3: Escape special characters
+    line = line.replace("&", "\\&")
+    line = line.replace("%", "\\%")
+    line = line.replace("#", "\\#")
+    line = line.replace("_", "\\_")
+    line = line.replace("{", "\\{")
+    line = line.replace("}", "\\}")
+    line = line.replace("~", "\\textasciitilde{}")
+    line = line.replace("^", "\\textasciicircum{}")
+
+    # Step 4: Restore protected regions
+    for idx, val in enumerate(protected):
+        line = line.replace(f"\x00ALG{idx}\x00", val)
+
+    return line + comment_suffix
 
 
 def _render_code_block(lang: str, code: str) -> str:
@@ -1234,7 +1409,8 @@ def _render_code_block(lang: str, code: str) -> str:
             if any(stripped.startswith(cmd) for cmd in _algo_cmds):
                 wrapped_lines.append(stripped)
             else:
-                wrapped_lines.append(f"\\STATE {stripped}")
+                # BUG-177: Escape LaTeX special chars in pseudocode lines
+                wrapped_lines.append(f"\\STATE {_escape_algo_line(stripped)}")
         body = "\n".join(wrapped_lines)
         return (
             "\\begin{algorithm}[ht]\n"
@@ -1310,6 +1486,16 @@ def _convert_inline(text: str) -> str:
     text = text.replace("\u2192", "$\\rightarrow$")  # →
     text = text.replace("\u2190", "$\\leftarrow$")   # ←
     text = text.replace("\u00d7", "$\\times$")     # ×
+    text = text.replace("\u2260", "$\\neq$")       # ≠
+    text = text.replace("\u2208", "$\\in$")         # ∈
+    text = text.replace("\u221e", "$\\infty$")      # ∞
+
+    # BUG-110: Replace Unicode Greek letters with LaTeX math equivalents.
+    # These appear when LLMs emit raw Unicode (e.g. "ε-greedy" instead of
+    # "$\epsilon$-greedy") and cause fatal pdflatex errors.
+    for _uchar, _lcmd in _UNICODE_GREEK_TO_LATEX.items():
+        if _uchar in text:
+            text = text.replace(_uchar, _lcmd)
 
     # Protect math and cite from escaping
     protected: list[str] = []
@@ -1329,6 +1515,11 @@ def _convert_inline(text: str) -> str:
 
     # Protect \cite{...} and \textbf etc.
     text = re.sub(r"\\[a-zA-Z]+\{[^}]*\}", _protect, text)
+
+    # BUG-182: Protect already-escaped LaTeX specials from double-escaping.
+    # LLMs often pre-escape underscores/etc: e.g. RawObs\_PPO → should stay
+    # as \_, not become \\_ which pdflatex interprets as linebreak + subscript.
+    text = re.sub(r"\\([#%&_{}])", _protect, text)
 
     # Protect \(...\) patterns with linebreaks already handled
     # (should be caught above, but safety net)
@@ -1373,9 +1564,10 @@ def _convert_inline(text: str) -> str:
         text,
     )
 
-    # Restore protected segments
-    for idx, val in enumerate(protected):
-        text = text.replace(f"\x00PROT{idx}\x00", val)
+    # Restore protected segments in reverse order so that nested
+    # markers (e.g. PROT0 inside PROT1's value) are resolved correctly.
+    for idx in range(len(protected) - 1, -1, -1):
+        text = text.replace(f"\x00PROT{idx}\x00", protected[idx])
 
     return text
 
@@ -1606,6 +1798,8 @@ def _escape_latex(text: str) -> str:
     text = re.sub(r"\\[a-zA-Z]+\{[^}]*\}", _protect, text)
 
     text = _LATEX_SPECIAL.sub(r"\\\1", text)
+    text = text.replace("~", "\\textasciitilde{}")
+    text = text.replace("^", "\\textasciicircum{}")
 
     for idx, val in enumerate(protected):
         text = text.replace(f"\x00PROT{idx}\x00", val)

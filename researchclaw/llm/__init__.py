@@ -23,8 +23,14 @@ PROVIDER_PRESETS = {
     "anthropic": {
         "base_url": "https://api.anthropic.com",
     },
+    "kimi-anthropic": {
+        "base_url": "https://api.kimi.com/coding/",
+    },
     "novita": {
         "base_url": "https://api.novita.ai/openai",
+    },
+    "minimax": {
+        "base_url": "https://api.minimax.io/v1",
     },
     "openai-compatible": {
         "base_url": None,  # Use user-provided base_url
@@ -37,10 +43,12 @@ def create_llm_client(config: RCConfig) -> LLMClient | ACPClient:
 
     - ``"acp"`` → :class:`ACPClient` (spawns an ACP-compatible agent)
     - ``"anthropic"`` → :class:`LLMClient` with Anthropic Messages API adapter
+    - ``"kimi-anthropic"`` → :class:`LLMClient` with Kimi Coding Anthropic adapter
     - ``"openrouter"`` → :class:`LLMClient` with OpenRouter base URL
     - ``"openai"`` → :class:`LLMClient` with OpenAI base URL
     - ``"deepseek"`` → :class:`LLMClient` with DeepSeek base URL
     - ``"novita"`` → :class:`LLMClient` with Novita AI base URL
+    - ``"minimax"`` → :class:`LLMClient` with MiniMax base URL
     - ``"openai-compatible"`` (default) → :class:`LLMClient` with custom base_url
 
     OpenRouter is fully compatible with the OpenAI API format, making it

@@ -156,16 +156,19 @@ class DockerSandbox:
         # Inject harness first (immutable)
         self._inject_harness(staging)
 
-        # Copy project files (skip harness overwrite)
-        for src_file in project_dir.iterdir():
-            if src_file.is_file():
-                dest = staging / src_file.name
-                if dest.name == "experiment_harness.py":
-                    logger.warning(
-                        "Project contains experiment_harness.py — skipping (immutable)"
-                    )
-                    continue
-                dest.write_bytes(src_file.read_bytes())
+        # Copy project files and subdirectories (skip harness overwrite)
+        import shutil as _shutil
+        for src_item in project_dir.iterdir():
+            dest = staging / src_item.name
+            if src_item.name == "experiment_harness.py":
+                logger.warning(
+                    "Project contains experiment_harness.py — skipping (immutable)"
+                )
+                continue
+            if src_item.is_file():
+                dest.write_bytes(src_item.read_bytes())
+            elif src_item.is_dir() and not src_item.name.startswith((".", "__")):
+                _shutil.copytree(src_item, dest, dirs_exist_ok=True)
 
         # Post-copy resolve check — catches symlink-based escapes
         err = validate_entry_point_resolved(staging, entry_point)
@@ -281,6 +284,7 @@ class DockerSandbox:
             stdout = completed.stdout
             stderr = completed.stderr
             returncode = completed.returncode
+            elapsed = time.monotonic() - start
         except subprocess.TimeoutExpired as exc:
             timed_out = True
             stdout = exc.stdout or ""
@@ -292,6 +296,7 @@ class DockerSandbox:
             returncode = -1
             # Force-kill the container on timeout
             self._kill_container(container_name)
+            elapsed = time.monotonic() - start
         except Exception as exc:  # noqa: BLE001
             elapsed = time.monotonic() - start
             return SandboxResult(
@@ -301,12 +306,12 @@ class DockerSandbox:
                 elapsed_sec=elapsed,
                 metrics={},
             )
-
-        elapsed = time.monotonic() - start
-
-        # Cleanup container (unless keep_containers is set)
-        if not cfg.keep_containers:
-            self._remove_container(container_name)
+        finally:
+            # Always clean up the container regardless of how we exit.
+            # docker rm -f is idempotent: safe even if container was
+            # already removed by --rm, already dead, or never created.
+            if not cfg.keep_containers:
+                self._remove_container(container_name)
 
         # Parse metrics from stdout
         metrics = parse_metrics(stdout)
@@ -395,23 +400,35 @@ class DockerSandbox:
             user_datasets.mkdir(parents=True, exist_ok=True)
             cmd.extend(["-v", f"{user_datasets}:/workspace/data:rw"])
 
-        # Mount HuggingFace model cache (read-only — experiments only read
-        # pretrained models; downloads happen via setup.py with network access
-        # and write to /workspace/data/hf instead).
+        # Mount HuggingFace model cache (read-only for model weights).
+        # BUG-103 fix: Don't set HF_HOME to the read-only mount — the
+        # transformers library writes token/telemetry files under HF_HOME.
+        # Instead, use HF_HUB_CACHE for read-only model access and let
+        # HF_HOME default to a writable location inside the container.
         hf_mounted = False
-        _hf_container = "/home/researcher/.cache/huggingface"
+        _hf_hub_cache = "/home/researcher/.cache/huggingface/hub"
         hf_home_env = os.environ.get("HF_HOME", "").strip()
         if hf_home_env:
             xdg_hf = Path(hf_home_env).resolve()
             if xdg_hf.is_dir():
-                cmd.extend(["-v", f"{xdg_hf}:{_hf_container}:ro"])
-                cmd.extend(["-e", f"HF_HOME={_hf_container}"])
+                cmd.extend(["-v", f"{xdg_hf}:{_hf_hub_cache}:ro"])
+                cmd.extend(["-e", f"HF_HUB_CACHE={_hf_hub_cache}"])
                 hf_mounted = True
         if not hf_mounted:
             hf_cache_host = Path.home() / ".cache" / "huggingface"
             if hf_cache_host.is_dir():
-                cmd.extend(["-v", f"{hf_cache_host}:{_hf_container}:ro"])
-                cmd.extend(["-e", f"HF_HOME={_hf_container}"])
+                cmd.extend(["-v", f"{hf_cache_host}:{_hf_hub_cache}:ro"])
+                cmd.extend(["-e", f"HF_HUB_CACHE={_hf_hub_cache}"])
+
+        # BUG-107 fix: Set TORCH_HOME to writable location so torchvision
+        # can download pretrained model weights (e.g., Inception-v3 for FID).
+        cmd.extend(["-e", "TORCH_HOME=/workspace/.cache/torch"])
+
+        # BUG-R52-03: Set HOME to a writable directory.  The container runs
+        # as the host user (--user UID:GID) whose HOME defaults to "/" when
+        # no matching passwd entry exists.  pip --user then fails with
+        # "Permission denied: '/.local'".
+        cmd.extend(["-e", "HOME=/workspace/.home"])
 
         # Pass HF token if available (for gated model downloads)
         hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
@@ -486,12 +503,13 @@ class DockerSandbox:
         import_re = re.compile(
             r"^\s*(?:import|from)\s+([\w.]+)", re.MULTILINE
         )
-        # Exclude local project modules (any .py file in staging_dir)
+        # Exclude local project modules (any .py file in staging_dir, recursive)
+        # BUG-DA8-13: Use rglob to also scan subdirectories
         local_modules = {
-            pyf.stem for pyf in staging_dir.glob("*.py")
+            pyf.stem for pyf in staging_dir.rglob("*.py")
         }
         detected: list[str] = []
-        for pyf in staging_dir.glob("*.py"):
+        for pyf in staging_dir.rglob("*.py"):
             if pyf.name == "setup.py":
                 continue  # Don't scan setup.py for experiment deps
             text = pyf.read_text(encoding="utf-8", errors="replace")

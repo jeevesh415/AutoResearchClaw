@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.request import Request, urlopen
 
+from researchclaw.web._ssrf import check_url_ssrf
+
 logger = logging.getLogger(__name__)
 
 
@@ -69,6 +71,9 @@ class WebCrawler:
 
     async def crawl(self, url: str) -> CrawlResult:
         """Crawl a URL and return Markdown content (async)."""
+        err = check_url_ssrf(url)
+        if err:
+            return CrawlResult(url=url, success=False, error=err, elapsed_seconds=0.0)
         t0 = time.monotonic()
         try:
             return await self._crawl_with_crawl4ai(url, t0)
@@ -83,6 +88,9 @@ class WebCrawler:
 
     def crawl_sync(self, url: str) -> CrawlResult:
         """Synchronous crawl — tries Crawl4AI via asyncio.run, falls back to urllib."""
+        err = check_url_ssrf(url)
+        if err:
+            return CrawlResult(url=url, success=False, error=err, elapsed_seconds=0.0)
         t0 = time.monotonic()
         try:
             return asyncio.run(self._crawl_with_crawl4ai(url, t0))
@@ -108,6 +116,10 @@ class WebCrawler:
 
             async with AsyncWebCrawler(config=browser_config) as crawler:
                 for url in urls:
+                    err = check_url_ssrf(url)
+                    if err:
+                        results.append(CrawlResult(url=url, success=False, error=err, elapsed_seconds=0.0))
+                        continue
                     t0 = time.monotonic()
                     try:
                         raw = await crawler.arun(url=url, config=run_config)
@@ -132,6 +144,10 @@ class WebCrawler:
         except ImportError:
             # Crawl4AI browser not set up — use urllib for each
             for url in urls:
+                err = check_url_ssrf(url)
+                if err:
+                    results.append(CrawlResult(url=url, success=False, error=err, elapsed_seconds=0.0))
+                    continue
                 t0 = time.monotonic()
                 try:
                     results.append(self._crawl_with_urllib(url, t0))
@@ -226,8 +242,8 @@ class WebCrawler:
         text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
         text = re.sub(r"<a[^>]*href=[\"']([^\"']*)[\"'][^>]*>(.*?)</a>", r"[\2](\1)", text, flags=re.DOTALL | re.IGNORECASE)
         text = re.sub(r"<[^>]+>", "", text)
-        text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-        text = text.replace("&quot;", '"').replace("&#39;", "'").replace("&nbsp;", " ")
+        import html as _html
+        text = _html.unescape(text)
         text = re.sub(r"\n{3,}", "\n\n", text)
         text = re.sub(r" {2,}", " ", text)
         return text.strip()

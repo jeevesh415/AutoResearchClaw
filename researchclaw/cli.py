@@ -28,11 +28,12 @@ from researchclaw.health import print_doctor_report, run_doctor, write_doctor_re
 
 def _is_opencode_installed() -> bool:
     """Check if the ``opencode`` CLI is available on PATH."""
-    if shutil.which("opencode") is None:
+    opencode_cmd = shutil.which("opencode")
+    if opencode_cmd is None:
         return False
     try:
         r = subprocess.run(
-            ["opencode", "--version"],
+            [opencode_cmd, "--version"],
             capture_output=True, text=True, timeout=15,
         )
         return r.returncode == 0
@@ -48,9 +49,13 @@ def _is_npm_installed() -> bool:
 def _install_opencode() -> bool:
     """Install OpenCode globally via npm.  Returns True on success."""
     print("  Installing opencode-ai (this may take a minute)...")
+    npm_cmd = shutil.which("npm")
+    if not npm_cmd:
+        print("  npm is not installed. Cannot install OpenCode.")
+        return False
     try:
         r = subprocess.run(
-            ["npm", "i", "-g", "opencode-ai@latest"],
+            [npm_cmd, "i", "-g", "opencode-ai@latest"],
             capture_output=True, text=True, timeout=120,
         )
         if r.returncode == 0:
@@ -204,6 +209,35 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     run_id = _generate_run_id(config.research.topic)
     run_dir = Path(output or f"artifacts/{run_id}")
+
+    # BUG-119: When --resume without --output, search for the most recent
+    # existing run directory that matches the topic and has a checkpoint.
+    if resume and not output:
+        topic_hash = hashlib.sha256(config.research.topic.encode()).hexdigest()[:6]
+        artifacts_root = Path("artifacts")
+        if artifacts_root.is_dir():
+            candidates = sorted(
+                (
+                    d for d in artifacts_root.iterdir()
+                    if d.is_dir()
+                    and d.name.startswith("rc-")
+                    and d.name.endswith(f"-{topic_hash}")
+                    and (d / "checkpoint.json").exists()
+                ),
+                key=lambda d: d.name,
+                reverse=True,  # newest first (timestamp in name)
+            )
+            if candidates:
+                run_dir = candidates[0]
+                run_id = run_dir.name
+                print(f"Found existing run to resume: {run_dir}")
+            else:
+                print(
+                    "Warning: --resume specified but no checkpoint found "
+                    f"for topic hash '{topic_hash}'. Starting new run.",
+                    file=sys.stderr,
+                )
+
     run_dir.mkdir(parents=True, exist_ok=True)
 
     if config.knowledge_base.root:
@@ -319,17 +353,197 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         write_doctor_report(report, Path(output))
     return 0 if report.overall == "pass" else 1
 
+def cmd_project(args: argparse.Namespace) -> int:
+    """C1: Multi-project management commands."""
+    from researchclaw.project.manager import ProjectManager
+
+    action = cast(str, args.project_action)
+    config_path = Path(cast(str, args.config))
+    config = RCConfig.load(config_path, check_paths=False)
+    pm = ProjectManager(Path(config.multi_project.projects_dir))
+
+    if action == "list":
+        projects = pm.list_all()
+        if not projects:
+            print("No projects found.")
+        for p in projects:
+            marker = " *" if pm.active and pm.active.name == p.name else ""
+            print(f"  {p.name} [{p.status}]{marker}")
+        return 0
+    elif action == "status":
+        status = pm.get_status()
+        print(f"Total projects: {status['total']}")
+        print(f"Active: {status.get('active', 'none')}")
+        return 0
+    elif action == "create":
+        name = cast(str, args.name)
+        topic = cast(str | None, getattr(args, "topic", None))
+        proj = pm.create(name, str(config_path), topic=topic or "")
+        print(f"Created project: {proj.name}")
+        return 0
+    elif action == "switch":
+        name = cast(str, args.name)
+        pm.switch(name)
+        print(f"Switched to project: {name}")
+        return 0
+    elif action == "compare":
+        names = cast(list[str], args.names)
+        if len(names) != 2:
+            print("Error: compare requires exactly 2 project names", file=sys.stderr)
+            return 1
+        result = pm.compare(names[0], names[1])
+        print(f"Comparing {names[0]} vs {names[1]}:")
+        for k, v in result.get("metric_diff", {}).items():
+            print(f"  {k}: delta={v['delta']:.4f}")
+        return 0
+    else:
+        print(f"Unknown project action: {action}", file=sys.stderr)
+        return 1
+
+
+def cmd_mcp(args: argparse.Namespace) -> int:
+    """C3: MCP integration commands."""
+    import asyncio
+
+    start = cast(bool, args.start)
+    if start:
+        from researchclaw.mcp.server import ResearchClawMCPServer
+
+        server = ResearchClawMCPServer()
+        print("Starting MCP server...")
+        asyncio.run(server.start())
+        return 0
+    else:
+        from researchclaw.mcp.tools import list_tool_names
+
+        names = list_tool_names()
+        print("Available MCP tools:")
+        for name in names:
+            print(f"  {name}")
+        return 0
+
+
+def cmd_overleaf(args: argparse.Namespace) -> int:
+    """C4: Overleaf sync commands."""
+    config_path = Path(cast(str, args.config))
+    config = RCConfig.load(config_path, check_paths=False)
+
+    if not config.overleaf.enabled:
+        print("Overleaf sync is not enabled in config.", file=sys.stderr)
+        return 1
+
+    from researchclaw.overleaf.sync import OverleafSync
+
+    sync = OverleafSync(
+        git_url=config.overleaf.git_url,
+        branch=config.overleaf.branch,
+    )
+
+    do_sync = cast(bool, args.sync)
+    do_status = cast(bool, args.status)
+
+    if do_status:
+        status = sync.get_status()
+        for k, v in status.items():
+            print(f"  {k}: {v}")
+        return 0
+    elif do_sync:
+        run_dir = Path(cast(str, args.run_dir))
+        if not run_dir.exists():
+            print(f"Error: run_dir not found: {run_dir}", file=sys.stderr)
+            return 1
+        sync.setup(run_dir)
+        sync.pull_changes()
+        print("Overleaf sync complete.")
+        return 0
+    else:
+        print("Use --sync or --status", file=sys.stderr)
+        return 1
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    """Start the FastAPI web server."""
+    config_path = Path(cast(str, args.config))
+    if not config_path.exists():
+        print(f"Error: config file not found: {config_path}", file=sys.stderr)
+        return 1
+
+    config = RCConfig.load(config_path, check_paths=False)
+    host = cast(str, args.host) or config.server.host
+    port = int(cast(int, args.port) or config.server.port)
+
+    try:
+        from researchclaw.server.app import create_app
+        import uvicorn
+    except ImportError as exc:
+        print(
+            f"Error: web dependencies not installed — pip install researchclaw[web]\n{exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    app = create_app(config, monitor_dir=args.monitor_dir)
+    uvicorn.run(app, host=host, port=port)
+    return 0
+
+
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    """Start dashboard-only server (no pipeline control)."""
+    config_path = Path(cast(str, args.config))
+    if not config_path.exists():
+        print(f"Error: config file not found: {config_path}", file=sys.stderr)
+        return 1
+
+    config = RCConfig.load(config_path, check_paths=False)
+    host = cast(str, args.host) or config.server.host
+    port = int(cast(int, args.port) or config.server.port)
+
+    try:
+        from researchclaw.server.app import create_app
+        import uvicorn
+    except ImportError as exc:
+        print(
+            f"Error: web dependencies not installed — pip install researchclaw[web]\n{exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    app = create_app(config, dashboard_only=True, monitor_dir=args.monitor_dir)
+    uvicorn.run(app, host=host, port=port)
+    return 0
+
+
+def cmd_wizard(args: argparse.Namespace) -> int:
+    """Run the interactive setup wizard."""
+    from researchclaw.wizard.quickstart import QuickStartWizard
+
+    wizard = QuickStartWizard()
+    output = cast(str | None, args.output)
+
+    import yaml
+
+    config = wizard.run_interactive()
+    if output:
+        Path(output).write_text(yaml.dump(config, default_flow_style=False))
+        print(f"Config written to {output}")
+    else:
+        print(yaml.dump(config, default_flow_style=False))
+    return 0
+
+
 _PROVIDER_CHOICES = {
     "1": ("openai", "OPENAI_API_KEY"),
     "2": ("openrouter", "OPENROUTER_API_KEY"),
     "3": ("deepseek", "DEEPSEEK_API_KEY"),
-    "4": ("acp", ""),
+    "4": ("minimax", "MINIMAX_API_KEY"),
+    "5": ("acp", ""),
 }
 
 _PROVIDER_URLS = {
     "openai": "https://api.openai.com/v1",
     "openrouter": "https://openrouter.ai/api/v1",
     "deepseek": "https://api.deepseek.com/v1",
+    "minimax": "https://api.minimax.io/v1",
 }
 
 _PROVIDER_MODELS = {
@@ -339,6 +553,7 @@ _PROVIDER_MODELS = {
         ["google/gemini-pro-1.5", "meta-llama/llama-3.1-70b-instruct"],
     ),
     "deepseek": ("deepseek-chat", ["deepseek-reasoner"]),
+    "minimax": ("MiniMax-M2.5", ["MiniMax-M2.5-highspeed"]),
 }
 
 
@@ -373,7 +588,8 @@ def cmd_init(args: argparse.Namespace) -> int:
         print("  1) openai       (requires OPENAI_API_KEY)")
         print("  2) openrouter   (requires OPENROUTER_API_KEY)")
         print("  3) deepseek     (requires DEEPSEEK_API_KEY)")
-        print("  4) acp          (local AI agent — no API key needed)")
+        print("  4) minimax      (requires MINIMAX_API_KEY)")
+        print("  5) acp          (local AI agent — no API key needed)")
         try:
             raw = input("Choice [1]: ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -391,7 +607,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     )
 
     if provider == "acp":
-        # ACP doesn't need base_url or api_key_env
+        # ACP doesn't need base_url or api_key
         content = content.replace(
             'base_url: "https://api.openai.com/v1"', 'base_url: ""'
         )
@@ -444,8 +660,9 @@ def cmd_setup(args: argparse.Namespace) -> int:
     # 1. OpenCode
     if _is_opencode_installed():
         try:
+            opencode_cmd = shutil.which("opencode") or "opencode"
             r = subprocess.run(
-                ["opencode", "--version"],
+                [opencode_cmd, "--version"],
                 capture_output=True, text=True, timeout=15,
             )
             ver = r.stdout.strip() or "unknown"
@@ -495,6 +712,85 @@ def cmd_report(args: argparse.Namespace) -> int:
     if output:
         write_report(run_dir, Path(output))
         print(f"\nReport written to {output}")
+    return 0
+
+
+# ── Research Enhancement commands (Agent D) ───────────────────────
+
+
+def cmd_trends(args: argparse.Namespace) -> int:
+    """Research trend tracking commands."""
+    config_path = Path(cast(str, args.config))
+    if not config_path.exists():
+        print(f"Error: config file not found: {config_path}", file=sys.stderr)
+        return 1
+
+    config = RCConfig.load(config_path, check_paths=False)
+
+    import asyncio
+
+    from researchclaw.trends.feeds import FeedManager
+    from researchclaw.trends.trend_analyzer import TrendAnalyzer
+
+    domains = cast(list[str] | None, args.domains) or list(config.research.domains)
+    if not domains:
+        domains = ["machine learning"]
+
+    feed_manager = FeedManager(
+        sources=config.trends.sources,
+        s2_api_key=config.llm.s2_api_key,
+    )
+
+    if cast(bool, args.digest):
+        from researchclaw.trends.daily_digest import DailyDigest
+
+        digest = DailyDigest(feed_manager)
+        result = asyncio.run(digest.generate(domains, config.trends.max_papers_per_day))
+        print(result)
+        return 0
+
+    if cast(bool, args.analyze):
+        papers = feed_manager.fetch_recent_papers(domains, max_papers=50)
+        analyzer = TrendAnalyzer()
+        analysis = analyzer.analyze(papers, config.trends.trend_window_days)
+        print(analyzer.generate_trend_report(analysis))
+        return 0
+
+    if cast(bool, args.suggest_topics):
+        from researchclaw.trends.auto_topic import AutoTopicGenerator
+        from researchclaw.trends.opportunity_finder import OpportunityFinder
+
+        papers = feed_manager.fetch_recent_papers(domains, max_papers=50)
+        analyzer = TrendAnalyzer()
+        finder = OpportunityFinder()
+        generator = AutoTopicGenerator(analyzer, finder)
+        candidates = asyncio.run(generator.generate_candidates(domains, papers))
+        print(generator.format_candidates(candidates))
+        return 0
+
+    print("Usage: researchclaw trends --digest|--analyze|--suggest-topics")
+    return 0
+
+
+def cmd_calendar(args: argparse.Namespace) -> int:
+    """Conference deadline calendar commands."""
+    from researchclaw.calendar.deadlines import ConferenceCalendar
+    from researchclaw.calendar.planner import SubmissionPlanner
+
+    calendar = ConferenceCalendar.load_builtin()
+    domains = cast(list[str] | None, args.domains)
+
+    if cast(bool, args.upcoming):
+        print(calendar.format_upcoming(domains=domains))
+        return 0
+
+    plan_venue = cast(str | None, args.plan)
+    if plan_venue:
+        planner = SubmissionPlanner(calendar)
+        print(planner.format_plan(plan_venue))
+        return 0
+
+    print("Usage: researchclaw calendar --upcoming|--plan <venue>")
     return 0
 
 def main(argv: list[str] | None = None) -> int:
@@ -559,6 +855,68 @@ def main(argv: list[str] | None = None) -> int:
         "--run-dir", required=True, help="Path to run artifacts directory"
     )
     _ = rpt_p.add_argument("--output", "-o", help="Write report to file")
+
+    # A: Web platform
+    srv_p = sub.add_parser("serve", help="Start the web server")
+    _ = srv_p.add_argument("--config", "-c", default="config.yaml", help="Config file path")
+    _ = srv_p.add_argument("--host", default="", help="Host to bind (default from config)")
+    _ = srv_p.add_argument("--port", type=int, default=0, help="Port (default from config)")
+    _ = srv_p.add_argument("--monitor-dir", help="Artifacts dir to monitor")
+
+    dash_p = sub.add_parser("dashboard", help="Start dashboard-only server")
+    _ = dash_p.add_argument("--config", "-c", default="config.yaml", help="Config file path")
+    _ = dash_p.add_argument("--host", default="", help="Host to bind")
+    _ = dash_p.add_argument("--port", type=int, default=0, help="Port")
+    _ = dash_p.add_argument("--monitor-dir", help="Artifacts dir to monitor")
+
+    wiz_p = sub.add_parser("wizard", help="Run the setup wizard")
+    _ = wiz_p.add_argument("--output", "-o", help="Write config to file")
+
+    # C1: Multi-project management
+    proj_p = sub.add_parser("project", help="Multi-project management")
+    _ = proj_p.add_argument(
+        "project_action",
+        choices=["list", "status", "create", "switch", "compare"],
+        help="Project action",
+    )
+    _ = proj_p.add_argument("--name", "-n", help="Project name")
+    _ = proj_p.add_argument("--names", nargs="*", help="Project names (for compare)")
+    _ = proj_p.add_argument("--topic", "-t", help="Research topic")
+    _ = proj_p.add_argument(
+        "--config", "-c", default="config.yaml", help="Config file path"
+    )
+
+    # C3: MCP integration
+    mcp_p = sub.add_parser("mcp", help="MCP integration")
+    _ = mcp_p.add_argument(
+        "--start", action="store_true", help="Start MCP server"
+    )
+
+    # C4: Overleaf sync
+    ovl_p = sub.add_parser("overleaf", help="Overleaf bidirectional sync")
+    _ = ovl_p.add_argument("--sync", action="store_true", help="Run sync")
+    _ = ovl_p.add_argument("--status", action="store_true", help="Show status")
+    _ = ovl_p.add_argument("--run-dir", help="Run artifacts directory")
+    _ = ovl_p.add_argument(
+        "--config", "-c", default="config.yaml", help="Config file path"
+    )
+
+    # D1: Research trend tracking
+    trends_p = sub.add_parser("trends", help="Research trend tracking")
+    _ = trends_p.add_argument("--digest", action="store_true", help="Generate daily digest")
+    _ = trends_p.add_argument("--analyze", action="store_true", help="Analyze trends")
+    _ = trends_p.add_argument(
+        "--suggest-topics", action="store_true", help="Suggest research topics"
+    )
+    _ = trends_p.add_argument("--config", "-c", default="config.yaml", help="Config file path")
+    _ = trends_p.add_argument("--domains", nargs="+", help="Override domains")
+
+    # D4: Conference deadline calendar
+    cal_p = sub.add_parser("calendar", help="Conference deadline calendar")
+    _ = cal_p.add_argument("--upcoming", action="store_true", help="Show upcoming deadlines")
+    _ = cal_p.add_argument("--plan", help="Generate submission timeline for a venue")
+    _ = cal_p.add_argument("--domains", nargs="+", help="Filter by domain")
+
     args = parser.parse_args(argv)
 
     command = cast(str | None, args.command)
@@ -575,6 +933,22 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_setup(args)
     elif command == "report":
         return cmd_report(args)
+    elif command == "serve":
+        return cmd_serve(args)
+    elif command == "dashboard":
+        return cmd_dashboard(args)
+    elif command == "wizard":
+        return cmd_wizard(args)
+    elif command == "project":
+        return cmd_project(args)
+    elif command == "mcp":
+        return cmd_mcp(args)
+    elif command == "overleaf":
+        return cmd_overleaf(args)
+    elif command == "trends":
+        return cmd_trends(args)
+    elif command == "calendar":
+        return cmd_calendar(args)
     else:
         parser.print_help()
         return 0
